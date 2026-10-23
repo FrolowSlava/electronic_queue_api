@@ -1,0 +1,87 @@
+name: electronic-queue-api
+
+services:
+  postgres:
+    image: postgres:17
+    environment:
+      POSTGRES_DB: electronic_queue
+      POSTGRES_USER: queue
+      POSTGRES_PASSWORD: queue_local
+    ports:
+      - "127.0.0.1:5434:5432"
+    volumes:
+      - postgres-data:/var/lib/postgresql/data
+    healthcheck:
+      test: ["CMD-SHELL", "pg_isready -U queue -d electronic_queue"]
+      interval: 2s
+      timeout: 3s
+      retries: 30
+
+  migrate:
+    image: migrate/migrate:v4.18.3
+    volumes:
+      - ./migrations:/migrations:ro
+    command: ["-path", "/migrations", "-database", "postgres://queue:queue_local@postgres:5432/electronic_queue?sslmode=disable", "up"]
+    depends_on:
+      postgres:
+        condition: service_healthy
+
+  api:
+    image: electronic-queue-api:local
+    build:
+      context: .
+      target: runtime
+    environment: &api-environment
+      HTTP_ADDR: ":8082"
+      DATABASE_URL: postgres://queue:queue_local@postgres:5432/electronic_queue?sslmode=disable
+      DOCS_DIR: /app
+    ports:
+      - "127.0.0.1:8082:8082"
+    depends_on:
+      migrate:
+        condition: service_completed_successfully
+    stop_grace_period: 20s
+
+  api2:
+    image: electronic-queue-api:local
+    build:
+      context: .
+      target: runtime
+    profiles: [replicas]
+    environment: *api-environment
+    ports:
+      - "127.0.0.1:8083:8082"
+    depends_on:
+      migrate:
+        condition: service_completed_successfully
+    stop_grace_period: 20s
+
+  test-db:
+    image: postgres:17
+    profiles: [test]
+    environment:
+      POSTGRES_DB: electronic_queue_test
+      POSTGRES_USER: queue
+      POSTGRES_PASSWORD: queue_test
+    tmpfs:
+      - /var/lib/postgresql/data
+    healthcheck:
+      test: ["CMD-SHELL", "pg_isready -U queue -d electronic_queue_test"]
+      interval: 2s
+      timeout: 3s
+      retries: 30
+
+  test:
+    build:
+      context: .
+      target: test
+    profiles: [test]
+    environment:
+      TEST_DATABASE_URL: postgres://queue:queue_test@test-db:5432/electronic_queue_test?sslmode=disable
+    depends_on:
+      test-db:
+        condition: service_healthy
+    command: ["go", "test", "./..."]
+
+volumes:
+  postgres-data:

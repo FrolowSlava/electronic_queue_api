@@ -1,0 +1,5 @@
+BEGIN;
+
+ALTER TABLE operators DROP COLUMN active;
+
+COMMIT;

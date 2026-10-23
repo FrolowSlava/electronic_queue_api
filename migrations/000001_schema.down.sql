@@ -1,0 +1,4 @@
+BEGIN;
+DROP TABLE tickets;
+DROP TABLE operators;
+COMMIT;
