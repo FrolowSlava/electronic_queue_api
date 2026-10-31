@@ -4,6 +4,8 @@ import (
 	"context"
 	"errors"
 	"fmt"
+	"strings"
+	"time"
 
 	"github.com/jackc/pgx/v5"
 	"github.com/jackc/pgx/v5/pgconn"
@@ -66,11 +68,7 @@ func (s *Store) Next(ctx context.Context, operatorID int64) (Ticket, error) {
 		}
 		return Ticket{}, fmt.Errorf("assign ticket: %w", err)
 	}
-	if err := tx.Commit(ctx); err != nil {
-		return Ticket{}, fmt.Errorf("commit next: %w", err)
-	}
-	// Успешная выдача возвращается только после фиксации назначения в БД.
-	return ticket, nil
+	return s.commitTicket(ctx, tx, ticket, "next")
 }
 
 func (s *Store) Complete(ctx context.Context, operatorID, ticketID int64) (Ticket, error) {
@@ -115,10 +113,70 @@ func (s *Store) finish(ctx context.Context, operatorID, ticketID int64, status s
 	if err != nil {
 		return Ticket{}, fmt.Errorf("finish ticket: %w", err)
 	}
-	if err := tx.Commit(ctx); err != nil {
-		return Ticket{}, fmt.Errorf("commit finish: %w", err)
+	return s.commitTicket(ctx, tx, ticket, "finish")
+}
+
+// commitTicket не повторяет изменение: при потере подтверждения COMMIT
+// проверяет сохранённый результат на исправном соединении из того же пула.
+func (s *Store) commitTicket(ctx context.Context, tx pgx.Tx, expected Ticket, operation string) (Ticket, error) {
+	err := tx.Commit(ctx)
+	if err == nil {
+		return expected, nil
 	}
-	return ticket, nil
+	commitErr := fmt.Errorf("commit %s: %w", operation, err)
+	rollback(tx)
+
+	// Явный отказ PostgreSQL сохраняет прежнюю ошибку. Потеря соединения,
+	// остановка сервера и statement_completion_unknown требуют проверки.
+	var pgErr *pgconn.PgError
+	if errors.Is(err, pgx.ErrTxCommitRollback) || errors.Is(err, pgx.ErrTxClosed) ||
+		errors.As(err, &pgErr) && !strings.HasPrefix(pgErr.Code, "08") &&
+			!strings.HasPrefix(pgErr.Code, "57") && pgErr.Code != "40003" {
+		return Ticket{}, commitErr
+	}
+
+	// Исходный HTTP-контекст уже мог истечь. Проверка получает собственный
+	// короткий срок, включая ожидание соединения и завершения старой операции.
+	checkCtx, cancel := context.WithTimeout(context.WithoutCancel(ctx), 2*time.Second)
+	defer cancel()
+	stored, checkErr := s.recoverTicket(checkCtx, expected)
+	if checkErr != nil {
+		// Ошибку проверки не раскрываем как самостоятельный business-конфликт:
+		// она не устанавливает исход первоначального изменения.
+		return Ticket{}, fmt.Errorf("%w: %w; verify result: %v", ErrCommitOutcomeUnknown, commitErr, checkErr)
+	}
+	return stored, nil
+}
+
+func (s *Store) recoverTicket(ctx context.Context, expected Ticket) (Ticket, error) {
+	if expected.OperatorID == nil || expected.StartedAt == nil {
+		return Ticket{}, fmt.Errorf("missing expected assignment")
+	}
+	tx, err := s.pool.BeginTx(ctx, pgx.TxOptions{IsoLevel: pgx.ReadCommitted})
+	if err != nil {
+		return Ticket{}, fmt.Errorf("begin result check: %w", err)
+	}
+	defer rollback(tx)
+	// Ждём завершения прежней транзакции, а затем отдельной SQL-командой
+	// получаем новый снимок READ COMMITTED. Чтение без блокировки могло бы
+	// увидеть waiting, пока первоначальный COMMIT ещё выполняется.
+	if _, err := lockOperator(ctx, tx, *expected.OperatorID); err != nil {
+		return Ticket{}, err
+	}
+	stored, err := scanTicket(tx.QueryRow(ctx,
+		"SELECT "+ticketColumns+" FROM tickets WHERE id = $1", expected.ID))
+	if err != nil {
+		return Ticket{}, fmt.Errorf("read result: %w", err)
+	}
+	sameStart := stored.StartedAt != nil && stored.StartedAt.Equal(*expected.StartedAt)
+	sameFinish := stored.FinishedAt == nil && expected.FinishedAt == nil ||
+		stored.FinishedAt != nil && expected.FinishedAt != nil && stored.FinishedAt.Equal(*expected.FinishedAt)
+	if stored.Status != expected.Status || stored.OperatorID == nil ||
+		*stored.OperatorID != *expected.OperatorID || !stored.CreatedAt.Equal(expected.CreatedAt) ||
+		!sameStart || !sameFinish {
+		return Ticket{}, fmt.Errorf("stored ticket %d does not match attempted %s result", expected.ID, expected.Status)
+	}
+	return stored, nil
 }
 
 func lockOperator(ctx context.Context, tx pgx.Tx, operatorID int64) (bool, error) {

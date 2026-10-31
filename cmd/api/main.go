@@ -16,6 +16,7 @@ import (
 	"electronic-queue-api/internal/config"
 	"electronic-queue-api/internal/httpapi"
 	"electronic-queue-api/internal/queue"
+
 	"github.com/jackc/pgx/v5/pgxpool"
 )
 
@@ -48,7 +49,8 @@ func run(logger *slog.Logger) error {
 		}
 		return fmt.Errorf("подключение к PostgreSQL не установлено")
 	}
-	defer pool.Close()
+	closePool := sync.OnceFunc(pool.Close)
+	defer closePool()
 
 	listener, err := net.Listen("tcp", cfg.HTTPAddr)
 	if err != nil {
@@ -86,20 +88,39 @@ func run(logger *slog.Logger) error {
 		stopSignals()
 	case serveErr = <-serveDone:
 	}
-	logger.Info("Остановка HTTP-сервера")
-	shutdownCtx, cancelShutdown := context.WithTimeout(context.Background(), cfg.ShutdownTimeout)
-	err = server.Shutdown(shutdownCtx)
-	cancelShutdown()
-	if err != nil {
-		logger.Warn("Истёк срок завершения запросов", "error", err)
-		cancelRequests()
-		_ = server.Close()
-	}
-	// Даже после Close обработчикам нужно закончить rollback и вернуть соединения.
-	active.Wait()
-	logger.Info("HTTP-сервер остановлен")
+	shutdown(server, &active, cancelRequests, closePool, logger, cfg.ShutdownTimeout)
 	if serveErr != nil && !errors.Is(serveErr, http.ErrServerClosed) {
 		return serveErr
 	}
 	return nil
+}
+
+// shutdown начинает окончательное завершение процесса. Watchdog намеренно
+// остаётся активным до выхода из main, включая отложенную очистку и логи.
+func shutdown(server *http.Server, active *sync.WaitGroup, cancelRequests context.CancelFunc,
+	closePool func(), logger *slog.Logger, timeout time.Duration) {
+	deadline := time.Now().Add(timeout)
+	time.AfterFunc(time.Until(deadline), func() {
+		// Логгер и очистка сами могут зависнуть. Последний выход не должен
+		// ждать их или выполнять defer: весь бюджет уже израсходован.
+		os.Exit(1)
+	})
+	logger.Info("Остановка HTTP-сервера", "timeout", timeout)
+
+	// Резерв на отмену, rollback и закрытие пула входит в общий срок,
+	// а не добавляется после него: при 15s получаем до 13s + до 2s.
+	cleanupReserve := min(2*time.Second, timeout/2)
+	graceCtx, cancelGrace := context.WithDeadline(context.Background(), deadline.Add(-cleanupReserve))
+	err := server.Shutdown(graceCtx)
+	cancelGrace()
+	cancelRequests()
+	if err != nil {
+		_ = server.Close()
+		logger.Warn("Истёк срок завершения запросов", "error", err)
+	}
+	// Закрытие HTTP-соединений не останавливает goroutine обработчика.
+	// Дожидаемся очистки при всё ещё действующем общем watchdog.
+	active.Wait()
+	closePool()
+	logger.Info("HTTP-сервер остановлен")
 }

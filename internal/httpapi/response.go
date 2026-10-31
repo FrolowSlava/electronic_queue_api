@@ -31,6 +31,12 @@ func writeError(w http.ResponseWriter, status int, code, message string, details
 }
 
 func (a *api) handleError(w http.ResponseWriter, r *http.Request, err error) {
+	if errors.Is(err, queue.ErrCommitOutcomeUnknown) {
+		a.logger.ErrorContext(r.Context(), "Не удалось подтвердить результат операции", "method", r.Method, "path", r.URL.Path, "error", err)
+		writeError(w, http.StatusServiceUnavailable, "operation_outcome_unknown",
+			"Не удалось подтвердить результат операции. Проверьте состояние оператора и талона через GET перед повтором", nil)
+		return
+	}
 	var domainErr *queue.Error
 	if errors.As(err, &domainErr) {
 		status := http.StatusConflict

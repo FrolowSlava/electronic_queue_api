@@ -92,6 +92,9 @@ func StartAPI(ctx context.Context, binary, databaseURL string, extraEnv ...strin
 		"DOCS_DIR=" + root, "DB_MAX_CONNS=10",
 		"REQUEST_TIMEOUT=20s", "SHUTDOWN_TIMEOUT=15s",
 		"DB_STATEMENT_TIMEOUT=15s", "DB_LOCK_TIMEOUT=10s",
+		// Race runtime обычно добавляет 1s при выходе. Эта тестовая задержка
+		// не должна пересекаться с коротким общим deadline shutdown.
+		"GORACE=" + os.Getenv("GORACE") + " atexit_sleep_ms=0",
 	}
 	settings = append(settings, extraEnv...)
 	env, err := processEnvironment(settings)

@@ -14,7 +14,7 @@ func TestLoad(t *testing.T) {
 	if err != nil {
 		t.Fatal(err)
 	}
-	if c.HTTPAddr != ":8082" || c.RequestTimeout != 5*time.Second || c.DocsDir != "." {
+	if c.HTTPAddr != ":8082" || c.RequestTimeout != 5*time.Second || c.ShutdownTimeout != 15*time.Second || c.DocsDir != "." {
 		t.Fatalf("неверные defaults: %+v", c)
 	}
 	pc, err := c.PoolConfig()
